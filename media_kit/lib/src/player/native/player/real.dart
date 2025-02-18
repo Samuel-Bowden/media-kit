@@ -46,7 +46,10 @@ void nativeEnsureInitialized({String? libmpv}) {
     if (references.isEmpty) {
       return;
     }
-    print('media_kit: Found ${references.length} reference(s). Disposing...');
+    const tag = NativeReferenceHolder.kTag;
+    print('$tag Found ${references.length} reference(s).');
+    print('$tag Disposing:\n${references.map((e) => e.address).join('\n')}');
+
     // I can only get quit to work; [mpv_terminate_destroy] causes direct crash.
     final mpv = generated.MPV(DynamicLibrary.open(NativeLibrary.path));
     final cmd = 'quit'.toNativeUtf8();
@@ -157,6 +160,14 @@ class NativePlayer extends PlatformPlayer {
       // Keep these [Media] objects in memory.
       current = playlist;
 
+      // External List<Media>:
+      // ---------------------------------------------
+      state = state.copyWith(playlist: Playlist(playlist, index: index));
+      if (!playlistController.isClosed) {
+        playlistController.add(Playlist(playlist, index: index));
+      }
+      // ---------------------------------------------
+
       // Restore original state & reset public [PlayerState] & [PlayerStream] values e.g. width=null, height=null, subtitle=['', ''] etc.
       await stop(
         open: true,
@@ -166,21 +177,41 @@ class NativePlayer extends PlatformPlayer {
       // Enter paused state.
       await _setPropertyFlag('pause', true);
 
-      final file = await TempFile.create();
-      String list = '';
-      for (final media in playlist) {
-        list += '${media.uri}\n';
+      if (playlist.any((media) => media.uri.startsWith('fd://'))) {
+        // The fd:// scheme is used to reference content:// URIs on Android.
+        // The loadlist command does not support this by default, yielding "Refusing to load potentially unsafe URL from a playlist."
+        // So, we fallback to loading each file individually.
+        for (int i = 0; i < playlist.length; i++) {
+          await _command(
+            [
+              'loadfile',
+              playlist[i].uri,
+              'append',
+            ],
+          );
+        }
+      } else {
+        final file = await TempFile.create();
+        final buffer = StringBuffer();
+        for (final media in playlist) {
+          buffer.writeln(media.uri);
+        }
+        final list = buffer.toString();
+
+        await file.write_(list);
+
+        await _command(
+          [
+            'loadlist',
+            file.path,
+            'append',
+          ],
+        );
+
+        Future.delayed(const Duration(seconds: 5), () {
+          file.delete_();
+        });
       }
-
-      await file.write_(list);
-
-      await _command(
-        [
-          'loadlist',
-          file.path,
-          'append',
-        ],
-      );
 
       // If [play] is `true`, then exit paused state.
       if (play) {
@@ -365,6 +396,7 @@ class NativePlayer extends PlatformPlayer {
       }
 
       isPlayingStateChangeAllowed = true;
+      isBufferingStateChangeAllowed = false;
       await _setPropertyFlag('pause', true);
     }
 
@@ -428,7 +460,13 @@ class NativePlayer extends PlatformPlayer {
 
       // External List<Media>:
       // ---------------------------------------------
-      current.add(media);
+      // Force a new List<T> object.
+      current = [...current, media];
+      final playlist = state.playlist.copyWith(medias: current);
+      state = state.copyWith(playlist: playlist);
+      if (!playlistController.isClosed) {
+        playlistController.add(playlist);
+      }
       // ---------------------------------------------
 
       await _command(['loadfile', media.uri, 'append']);
@@ -451,35 +489,71 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
 
-      // External List<Media>:
-      // ---------------------------------------------
-      current.removeAt(index);
-      // ---------------------------------------------
+      int currentIndex = state.playlist.index;
 
       // If we remove the last item in the playlist while playlist mode is none or single, then playback will stop.
       // In this situation, the playlist doesn't seem to be updated, so we manually update it.
-      if (state.playlist.index == index &&
-          state.playlist.medias.length - 1 == index &&
+      if (currentIndex == index &&
+          current.length - 1 == index &&
           [
             PlaylistMode.none,
             PlaylistMode.single,
           ].contains(state.playlistMode)) {
+        currentIndex = current.length - 2 < 0 ? 0 : current.length - 2;
+
         state = state.copyWith(
           // Allow playOrPause /w state.completed code-path to play the playlist again.
           completed: true,
           playlist: state.playlist.copyWith(
-            medias: state.playlist.medias.sublist(
-              0,
-              state.playlist.medias.length - 1,
-            ),
-            index: state.playlist.medias.length - 2 < 0
-                ? 0
-                : state.playlist.medias.length - 2,
+            medias: current.sublist(0, current.length - 1),
+            index: currentIndex,
           ),
         );
         if (!completedController.isClosed) {
           completedController.add(true);
         }
+        if (!playlistController.isClosed) {
+          playlistController.add(state.playlist);
+        }
+      }
+      // If we remove the last item in the playlist while playlist mode is loop, jump to the index 0.
+      else if (state.playlist.index == index &&
+          current.length - 1 == index &&
+          state.playlistMode == PlaylistMode.loop) {
+        currentIndex = 0;
+        state = state.copyWith(
+          // Allow playOrPause /w state.completed code-path to play the playlist again.
+          completed: true,
+          playlist: state.playlist.copyWith(
+            medias: current.sublist(0, current.length - 1),
+            index: 0,
+          ),
+        );
+        if (!completedController.isClosed) {
+          completedController.add(true);
+        }
+        if (!playlistController.isClosed) {
+          playlistController.add(state.playlist);
+        }
+      }
+
+      // Default
+      else {
+        current = [...current]; // Force a new List<T> object.
+        current.removeAt(index);
+
+        // If the current index is greater than the removed index, then the current index should be reduced by 1.
+        // If the current index is equal or less than the removed index, then the current index should not be changed.
+        if (state.playlist.index > index) {
+          currentIndex--;
+        }
+
+        state = state.copyWith(
+          playlist: state.playlist.copyWith(
+            medias: current,
+            index: currentIndex,
+          ),
+        );
         if (!playlistController.isClosed) {
           playlistController.add(state.playlist);
         }
@@ -597,6 +671,12 @@ class NativePlayer extends PlatformPlayer {
       }
       final values = map.values.toList();
       current = values;
+      final playlist = state.playlist.copyWith(medias: current);
+      state = state.copyWith(playlist: playlist);
+      if (!playlistController.isClosed) {
+        playlistController.add(playlist);
+      }
+
       // ---------------------------------------------
 
       await _command(['playlist-move', from.toString(), to.toString()]);
@@ -729,9 +809,7 @@ class NativePlayer extends PlatformPlayer {
       if (configuration.pitch) {
         // Pitch shift control is enabled.
 
-        state = state.copyWith(
-          rate: rate,
-        );
+        state = state.copyWith(rate: rate);
         if (!rateController.isClosed) {
           rateController.add(state.rate);
         }
@@ -745,9 +823,7 @@ class NativePlayer extends PlatformPlayer {
       } else {
         // Pitch shift control is disabled.
 
-        state = state.copyWith(
-          rate: rate,
-        );
+        state = state.copyWith(rate: rate);
         if (!rateController.isClosed) {
           rateController.add(state.rate);
         }
@@ -783,9 +859,7 @@ class NativePlayer extends PlatformPlayer {
 
         // Pitch shift control is enabled.
 
-        state = state.copyWith(
-          pitch: pitch,
-        );
+        state = state.copyWith(pitch: pitch);
         if (!pitchController.isClosed) {
           pitchController.add(state.pitch);
         }
@@ -1351,7 +1425,10 @@ class NativePlayer extends PlatformPlayer {
       return;
     }
 
-    _error(event.ref.error);
+    _logError(
+      event.ref.error,
+      'event:${event.ref.event_id} ${event.ref.data.cast<Uint8>()}',
+    );
 
     if (event.ref.event_id == generated.mpv_event_id.MPV_EVENT_START_FILE) {
       if (isPlayingStateChangeAllowed) {
@@ -1452,7 +1529,8 @@ class NativePlayer extends PlatformPlayer {
       if (prop.ref.name.cast<Utf8>().toDartString() == 'time-pos' &&
           prop.ref.format == generated.mpv_format.MPV_FORMAT_DOUBLE) {
         final position = Duration(
-            microseconds: prop.ref.data.cast<Double>().value * 1e6 ~/ 1);
+          microseconds: prop.ref.data.cast<Double>().value * 1e6 ~/ 1,
+        );
         state = state.copyWith(position: position);
         if (!positionController.isClosed) {
           positionController.add(position);
@@ -1461,7 +1539,8 @@ class NativePlayer extends PlatformPlayer {
       if (prop.ref.name.cast<Utf8>().toDartString() == 'duration' &&
           prop.ref.format == generated.mpv_format.MPV_FORMAT_DOUBLE) {
         final duration = Duration(
-            microseconds: prop.ref.data.cast<Double>().value * 1e6 ~/ 1);
+          microseconds: prop.ref.data.cast<Double>().value * 1e6 ~/ 1,
+        );
         state = state.copyWith(duration: duration);
         if (!durationController.isClosed) {
           durationController.add(duration);
@@ -1487,69 +1566,15 @@ class NativePlayer extends PlatformPlayer {
           }
         }
       }
-      if (prop.ref.name.cast<Utf8>().toDartString() == 'playlist' &&
-          prop.ref.format == generated.mpv_format.MPV_FORMAT_NODE) {
-        final data = prop.ref.data.cast<generated.mpv_node>();
-        final list = data.ref.u.list.ref;
-        int index = -1;
-        List<Media> playlist = [];
-        for (int i = 0; i < list.num; i++) {
-          if (list.values[i].format ==
-              generated.mpv_format.MPV_FORMAT_NODE_MAP) {
-            final map = list.values[i].u.list.ref;
-            for (int j = 0; j < map.num; j++) {
-              final property = map.keys[j].cast<Utf8>().toDartString();
-              if (map.values[j].format ==
-                  generated.mpv_format.MPV_FORMAT_FLAG) {
-                if (property == 'playing') {
-                  final value = map.values[j].u.flag;
-                  if (value == 1) {
-                    index = i;
-                  }
-                }
-              }
-              if (map.values[j].format ==
-                  generated.mpv_format.MPV_FORMAT_STRING) {
-                if (property == 'filename') {
-                  final v = map.values[j].u.string.cast<Utf8>().toDartString();
-                  playlist.add(Media(v));
-                }
-              }
-            }
-          }
-        }
-
-        // Populate start & end attributes from [current].
-        try {
-          playlist = playlist
-              .asMap()
-              .map(
-                (i, e) => MapEntry(
-                  i,
-                  e.copyWith(start: current[i].start, end: current[i].end),
-                ),
-              )
-              .values
-              .toList();
-        } catch (exception, stacktrace) {
-          print(exception.toString());
-          print(stacktrace.toString());
-        }
-
+      if (prop.ref.name.cast<Utf8>().toDartString() == 'playlist-playing-pos' &&
+          prop.ref.format == generated.mpv_format.MPV_FORMAT_INT64 &&
+          prop.ref.data != nullptr) {
+        final index = prop.ref.data.cast<Int64>().value;
         if (index >= 0) {
-          state = state.copyWith(
-            playlist: Playlist(
-              playlist,
-              index: index,
-            ),
-          );
+          final playlist = Playlist(current, index: index);
+          state = state.copyWith(playlist: playlist);
           if (!playlistController.isClosed) {
-            playlistController.add(
-              Playlist(
-                playlist,
-                index: index,
-              ),
-            );
+            playlistController.add(playlist);
           }
         }
       }
@@ -1984,7 +2009,12 @@ class NativePlayer extends PlatformPlayer {
           if (fn != null) {
             final data = mpv.mpv_get_property_string(ctx, prop.ref.name);
             if (data != nullptr) {
-              await fn.call(data.cast<Utf8>().toDartString());
+              try {
+                await fn.call(data.cast<Utf8>().toDartString());
+              } catch (exception, stacktrace) {
+                print(exception);
+                print(stacktrace);
+              }
               mpv.mpv_free(data.cast());
             }
           }
@@ -2168,10 +2198,7 @@ class NativePlayer extends PlatformPlayer {
               }
             }
           }
-        } catch (exception, stacktrace) {
-          print(exception);
-          print(stacktrace);
-        }
+        } catch (_) {}
         // --------------------------------------------------
         mpv.mpv_hook_continue(
           ctx,
@@ -2387,7 +2414,7 @@ class NativePlayer extends PlatformPlayer {
         'pause': generated.mpv_format.MPV_FORMAT_FLAG,
         'time-pos': generated.mpv_format.MPV_FORMAT_DOUBLE,
         'duration': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'playlist': generated.mpv_format.MPV_FORMAT_NODE,
+        'playlist-playing-pos': generated.mpv_format.MPV_FORMAT_INT64,
         'volume': generated.mpv_format.MPV_FORMAT_DOUBLE,
         'speed': generated.mpv_format.MPV_FORMAT_DOUBLE,
         'core-idle': generated.mpv_format.MPV_FORMAT_FLAG,
@@ -2446,10 +2473,16 @@ class NativePlayer extends PlatformPlayer {
   }
 
   /// Adds an error to the [Player.stream.error].
-  void _error(int code) {
-    if (code < 0 && !errorController.isClosed) {
+  void _logError(int code, String? text) {
+    if (code < 0 && !logController.isClosed) {
       final message = mpv.mpv_error_string(code).cast<Utf8>().toDartString();
-      errorController.add(message);
+      logController.add(
+        PlayerLog(
+          prefix: 'media_kit',
+          level: 'error',
+          text: 'error: $message $text',
+        ),
+      );
     }
   }
 
@@ -2457,28 +2490,34 @@ class NativePlayer extends PlatformPlayer {
   final Map<int, Completer<int>> _setPropertyRequests = {};
   final Map<int, Completer<int>> _commandRequests = {};
 
-  Future<void> _setProperty(
-    String name,
-    int format,
-    Pointer<Void> data,
-  ) async {
+  Future<void> _setProperty(String name, int format, Pointer<Void> data) async {
     final requestNumber = _asyncRequestNumber++;
     final completer = _setPropertyRequests[requestNumber] = Completer<int>();
     final namePtr = name.toNativeUtf8();
-    final immediate = mpv.mpv_set_property_async(
-      ctx,
-      requestNumber,
-      namePtr.cast(),
-      format,
-      data,
-    );
-    calloc.free(namePtr);
-    if (immediate < 0) {
-      // Sending failed.
-      _error(immediate);
-      return;
+    if (configuration.async) {
+      final immediate = mpv.mpv_set_property_async(
+        ctx,
+        requestNumber,
+        namePtr.cast(),
+        format,
+        data,
+      );
+      final text = '_setProperty($name, $format)';
+      if (immediate < 0) {
+        // Sending failed.
+        _logError(immediate, text);
+        return;
+      }
+      _logError(await completer.future, text);
+    } else {
+      mpv.mpv_set_property(
+        ctx,
+        namePtr.cast(),
+        format,
+        data,
+      );
     }
-    _error(await completer.future);
+    calloc.free(namePtr);
   }
 
   Future<void> _setPropertyFlag(String name, bool value) async {
@@ -2525,25 +2564,30 @@ class NativePlayer extends PlatformPlayer {
     calloc.free(string);
   }
 
-  /// Calls mpv command passed as [args].
-  /// Automatically freeds memory after command sending.
   Future<void> _command(List<String> args) async {
     final pointers = args.map<Pointer<Utf8>>((e) => e.toNativeUtf8()).toList();
     final arr = calloc<Pointer<Utf8>>(128);
     for (int i = 0; i < args.length; i++) {
       (arr + i).value = pointers[i];
     }
-    final requestNumber = _asyncRequestNumber++;
-    final completer = _commandRequests[requestNumber] = Completer<int>();
-    final immediate = mpv.mpv_command_async(ctx, requestNumber, arr.cast());
+
+    if (configuration.async) {
+      final requestNumber = _asyncRequestNumber++;
+      final completer = _commandRequests[requestNumber] = Completer<int>();
+      final immediate = mpv.mpv_command_async(ctx, requestNumber, arr.cast());
+      final text = '_command(${args.join(', ')})';
+      if (immediate < 0) {
+        // Sending failed.
+        _logError(immediate, text);
+        return;
+      }
+      _logError(await completer.future, text);
+    } else {
+      mpv.mpv_command(ctx, arr.cast());
+    }
+
     calloc.free(arr);
     pointers.forEach(calloc.free);
-    if (immediate < 0) {
-      // Sending failed.
-      _error(immediate);
-      return;
-    }
-    _error(await completer.future);
   }
 
   /// Generated libmpv C API bindings.
