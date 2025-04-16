@@ -10,7 +10,7 @@ cmake_minimum_required(VERSION 3.13)
 option(MEDIA_KIT_LIBS_AVAILABLE "package:media_kit libraries are available." ON)
 
 # This is the public option enabling dynamic linking on request of applications.
-option(MIMALLOC_USE_STATIC_LIBS "Whether to prefer linking to mimalloc statically" ON)
+option(MIMALLOC_USE_STATIC_LIBS "Whether to prefer linking to mimalloc statically" OFF)
 
 set(PROJECT_NAME "media_kit_libs_linux")
 project(${PROJECT_NAME} LANGUAGES CXX)
@@ -96,8 +96,6 @@ if(MIMALLOC_USE_STATIC_LIBS)
     add_custom_command(
       OUTPUT ${MIMALLOC_LIB}
       COMMAND "${CMAKE_COMMAND}" -E tar xzf "${MIMALLOC_ARCHIVE}"
-
-      # add_subdirectory() is too much work. Alternatively building it through command line.
       COMMAND "mkdir" "-p" "out/release"
       COMMAND "cd" "out/release"
       COMMAND "${CMAKE_COMMAND}" "../../mimalloc-2.1.2"
